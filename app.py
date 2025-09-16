@@ -6,9 +6,19 @@ import requests
 import base64
 
 app = Flask(__name__)
-CORS(app)
+# Enable CORS for all origins (good for testing)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 app.config['UPLOAD_FOLDER'] = '../uploads'
+
+# In-memory points storage for demo (replace with real DB later)
+user_points_storage = {}
+
+def get_user_points(user_id):
+    return user_points_storage.get(user_id, 0)
+
+def set_user_points(user_id, points):
+    user_points_storage[user_id] = points
 
 @app.route('/')
 def index():
@@ -18,15 +28,17 @@ def index():
 def upload():
     if "image" not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
+
     image = request.files["image"]
     name = secure_filename(image.filename)
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     path = os.path.join(app.config['UPLOAD_FOLDER'], name)
     image.save(path)
 
-    # Call Plant.id API (existing code)
     with open(path, "rb") as img_f:
         img_b64 = base64.b64encode(img_f.read()).decode("ascii")
-    api_key = "<YOUR_PLANTID_API_KEY>"  # replace
+
+    api_key = "1VkeVK7iJfw6AbMXkdxZoePg9Ys55eFWMQubuKRMdivwtyzTKD"
     url = "https://api.plant.id/v2/identify"
     response = requests.post(
         url,
@@ -39,6 +51,7 @@ def upload():
         timeout=45,
     )
     info = response.json()
+
     if info.get('suggestions'):
         species = info['suggestions'][0].get('plant_name', 'Unknown')
         confidence = int(info['suggestions'][0].get('probability', 0) * 100)
@@ -48,11 +61,11 @@ def upload():
         confidence = 0
         facts = "No facts found."
 
-    # --- Point system logic ---
-    user_id = request.form.get('user_id', 'demo_user')  # For demo, use a static user
-    user_points = get_user_points(user_id)  # Function to get current points
-    user_points += 1  # Each tree found = 1 point
-    set_user_points(user_id, user_points)  # Save back to storage
+    # Points system - static user for demo
+    user_id = request.form.get('user_id', 'demo_user')
+    user_points = get_user_points(user_id)
+    user_points += 1
+    set_user_points(user_id, user_points)
 
     return jsonify({
         "success": True,
@@ -65,27 +78,15 @@ def upload():
         "points": user_points
     })
 
-# Helper functions for points (demo, in-memory storage)
-user_points_storage = {}  # For demo, replace with actual persistent DB
-
-def get_user_points(user_id):
-    return user_points_storage.get(user_id, 0)
-
-def set_user_points(user_id, points):
-    user_points_storage[user_id] = points
-
 @app.route('/leaderboard', methods=['GET'])
 def leaderboard():
-    # simulate leaderboard with static or stored user points
     leaderboard_data = [
         {"user": "User1", "points": get_user_points("user1")},
         {"user": "User2", "points": get_user_points("user2")},
         {"user": "Demo User", "points": get_user_points("demo_user")},
     ]
-    # Sort by points desc
     leaderboard_data.sort(key=lambda x: x['points'], reverse=True)
     return jsonify(leaderboard_data)
-
 
 if __name__ == "__main__":
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
