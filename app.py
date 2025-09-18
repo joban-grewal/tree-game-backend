@@ -85,6 +85,7 @@ def upload():
             "species": species,
             "confidence": confidence,
             "facts": facts
+            "wiki_summary": wiki_summary
         },
         "points": user_points
     })
