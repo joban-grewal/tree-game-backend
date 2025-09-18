@@ -5,6 +5,17 @@ from werkzeug.utils import secure_filename
 import requests
 import base64
 
+
+def get_wikipedia_summary(title):
+    """Fetch Wikipedia summary for tree species (common/scientific name)."""
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get('extract', 'No Wikipedia summary available.')
+    return 'No Wikipedia summary available.'
+
+
 app = Flask(__name__)
 # Enable CORS for all origins (good for testing)
 CORS(app, resources={r"/*": {"origins": "*"}})
