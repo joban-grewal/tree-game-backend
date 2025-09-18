@@ -7,12 +7,43 @@ import base64
 
 
 def get_wikipedia_summary(title):
-    """Fetch Wikipedia summary for tree species (common/scientific name)."""
-    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title.replace(' ', '_')}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        data = response.json()
-        return data.get('extract', 'No Wikipedia summary available.')
+    """Fetch Wikipedia summary with fallback to search API if needed."""
+
+    base_url = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+    search_url = "https://en.wikipedia.org/w/api.php"
+
+    def fetch_summary(page_title):
+        url = base_url + page_title.replace(' ', '_')
+        response = requests.get(url)
+        if response.status_code == 200:
+            data = response.json()
+            if 'extract' in data:
+                return data['extract']
+        return None
+
+    # Try direct summary fetch
+    summary = fetch_summary(title)
+    if summary:
+        return summary
+
+    # If direct fetch failed, try search API to find closest page
+    params = {
+        'action': 'query',
+        'list': 'search',
+        'srsearch': title,
+        'format': 'json',
+        'srlimit': 1,
+    }
+    try:
+        res = requests.get(search_url, params=params)
+        data = res.json()
+        search_results = data.get('query', {}).get('search', [])
+        if search_results:
+            best_match_title = search_results[0]['title']
+            return fetch_summary(best_match_title)
+    except Exception:
+        pass
+
     return 'No Wikipedia summary available.'
 
 
@@ -70,11 +101,10 @@ def upload():
     if info.get('suggestions'):
         species = info['suggestions'][0].get('plant_name', 'Unknown')
         confidence = int(info['suggestions'][0].get('probability', 0) * 100)
-        facts = info['suggestions'][0].get('plant_details', {}).get('wiki_description', {}).get('value', 'No facts found.')
+        # Removed facts as per your request
     else:
         species = "Unknown"
         confidence = 0
-        facts = "No facts found."
 
     # Fetch Wikipedia summary for the tree species
     wiki_summary = get_wikipedia_summary(species)
@@ -91,7 +121,6 @@ def upload():
         "info": {
             "species": species,
             "confidence": confidence,
-            "facts": facts,
             "wiki_summary": wiki_summary
         },
         "points": user_points
