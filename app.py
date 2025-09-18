@@ -7,18 +7,26 @@ import base64
 
 
 def get_wikipedia_summary(title):
-    """Fetch Wikipedia summary with fallback to search API if needed."""
-
+    """Fetch Wikipedia summary with improved error handling and headers."""
+    # CHANGED: Added a User-Agent header to mimic a browser request
+    headers = {
+        'User-Agent': 'TreeGuardianGame/1.0 (https://yourapp.com; your-email@example.com)'
+    }
+    
     base_url = "https://en.wikipedia.org/api/rest_v1/page/summary/"
     search_url = "https://en.wikipedia.org/w/api.php"
 
     def fetch_summary(page_title):
-        url = base_url + page_title.replace(' ', '_')
-        response = requests.get(url)
-        if response.status_code == 200:
-            data = response.json()
-            if 'extract' in data:
-                return data['extract']
+        try:
+            url = base_url + page_title.replace(' ', '_')
+            response = requests.get(url, headers=headers, timeout=10) # Added headers
+            if response.status_code == 200:
+                data = response.json()
+                if 'extract' in data:
+                    return data['extract']
+        except Exception as e:
+            # CHANGED: Added print(e) to log the actual error
+            print(f"Error fetching direct summary for {page_title}: {e}")
         return None
 
     # Try direct summary fetch
@@ -35,14 +43,15 @@ def get_wikipedia_summary(title):
         'srlimit': 1,
     }
     try:
-        res = requests.get(search_url, params=params)
+        res = requests.get(search_url, params=params, headers=headers, timeout=10) # Added headers
         data = res.json()
         search_results = data.get('query', {}).get('search', [])
         if search_results:
             best_match_title = search_results[0]['title']
             return fetch_summary(best_match_title)
-    except Exception:
-        pass
+    except Exception as e:
+        # CHANGED: Added print(e) to log the actual error
+        print(f"Error during Wikipedia search for {title}: {e}")
 
     return 'No Wikipedia summary available.'
 
