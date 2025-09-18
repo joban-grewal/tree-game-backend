@@ -25,15 +25,19 @@ app.config['UPLOAD_FOLDER'] = '../uploads'
 # In-memory points storage for demo (replace with real DB later)
 user_points_storage = {}
 
+
 def get_user_points(user_id):
     return user_points_storage.get(user_id, 0)
+
 
 def set_user_points(user_id, points):
     user_points_storage[user_id] = points
 
+
 @app.route('/')
 def index():
     return jsonify({"message": "API is working!"})
+
 
 @app.route('/upload', methods=['POST'])
 def upload():
@@ -72,6 +76,9 @@ def upload():
         confidence = 0
         facts = "No facts found."
 
+    # Fetch Wikipedia summary for the tree species
+    wiki_summary = get_wikipedia_summary(species)
+
     # Points system - static user for demo
     user_id = request.form.get('user_id', 'demo_user')
     user_points = get_user_points(user_id)
@@ -84,11 +91,12 @@ def upload():
         "info": {
             "species": species,
             "confidence": confidence,
-            "facts": facts
+            "facts": facts,
             "wiki_summary": wiki_summary
         },
         "points": user_points
     })
+
 
 @app.route('/leaderboard', methods=['GET'])
 def leaderboard():
@@ -99,6 +107,7 @@ def leaderboard():
     ]
     leaderboard_data.sort(key=lambda x: x['points'], reverse=True)
     return jsonify(leaderboard_data)
+
 
 if __name__ == "__main__":
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
