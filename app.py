@@ -18,8 +18,11 @@ CORS(app) # Enable CORS for all routes
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- 2. CONFIGURE AI MODELS (SECURELY) ---
+# --- NEW: Health Check Flag ---
+# This variable will track if our heavy model is ready.
+MODEL_IS_LOADED = False
 
+# --- 2. CONFIGURE AI MODELS (SECURELY) ---
 # FIXED: Load API keys safely from environment variables
 GEMINI_API_KEY = os.environ.get('AIzaSyAfEBbRrXlxwqgbvOXM9SblWJukYQc7sBc')
 PLANT_ID_API_KEY = os.environ.get('1VkeVK7iJfw6AbMXkdxZoePg9Ys55eFWMQubuKRMdivwtyzTKD')
@@ -39,6 +42,9 @@ class_names = [
     'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 
     'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
 ]
+print("Health model loaded successfully!")
+# --- NEW: Flip the flag to True now that the model is loaded ---
+MODEL_IS_LOADED = True
 
 # In-memory storage for demo purposes
 user_points_storage = {}
@@ -93,6 +99,18 @@ def get_wikipedia_summary(title):
     return 'No Wikipedia summary available.'
 
 # --- 4. API ENDPOINTS ---
+
+
+# --- NEW: Smart Health Check Endpoint ---
+@app.route('/healthz')
+def health_check():
+    # This endpoint will be pinged by Render.
+    # It will fail until the model is loaded, then it will succeed.
+    if MODEL_IS_LOADED:
+        return jsonify({"status": "ok"}), 200
+    else:
+        # Return a 503 Service Unavailable status while the model is loading
+        return jsonify({"status": "model_loading"}), 503
 
 @app.route('/upload', methods=['POST'])
 def upload():
