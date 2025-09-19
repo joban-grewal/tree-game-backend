@@ -5,8 +5,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import google.generativeai as genai
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing import image
+import tflite_runtime.interpreter as tflite
+from PIL import Image # Pillow is now used directly
 import numpy as np
 from dotenv import load_dotenv
 
@@ -33,7 +33,11 @@ if not GEMINI_API_KEY or not PLANT_ID_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Load your trained health model
-health_model = load_model('punjab_crops_model.h5')
+# --- CHANGED: Load the TFLite model ---
+interpreter = tflite.Interpreter(model_path="model.tflite")
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 class_names = [
     'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_', 
     'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Potato___Early_blight', 
@@ -51,21 +55,29 @@ user_points_storage = {}
 
 # --- 3. HELPER FUNCTIONS ---
 
+# --- REWRITTEN: predict_health function for TFLite ---
 def predict_health(image_path):
-    # Your predict_health function is good, no changes needed here.
     try:
-        img = image.load_img(image_path, target_size=(224, 224))
-        img_array = image.img_to_array(img)
+        # Load and preprocess the image
+        img = Image.open(image_path).resize((224, 224))
+        img_array = np.array(img, dtype=np.float32)
         img_array = np.expand_dims(img_array, axis=0) / 255.0
-        predictions = health_model.predict(img_array)
+
+        # Set the tensor, invoke the interpreter, and get results
+        interpreter.set_tensor(input_details[0]['index'], img_array)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_details[0]['index'])
+        
         predicted_class = class_names[np.argmax(predictions[0])]
         confidence = round(100 * np.max(predictions[0]), 2)
+        
         disease_name = predicted_class.split('___')[-1].replace('_', ' ')
         plant_name = predicted_class.split('___')[0].replace('_', ' ')
         diagnosis = f"{plant_name}: {disease_name} (Confidence: {confidence}%)"
+        
         return diagnosis, disease_name, plant_name
     except Exception as e:
-        print(f"Error in health prediction: {e}")
+        print(f"Error in TFLite health prediction: {e}")
         return "Health status could not be determined.", None, None
 
 def get_care_advice(disease_name, plant_name):
