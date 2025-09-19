@@ -5,8 +5,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import google.generativeai as genai
-import tflite_runtime.interpreter as tflite
-from PIL import Image # Pillow is now used directly
+import tensorflow as tf
+from PIL import Image
 import numpy as np
 from dotenv import load_dotenv
 
@@ -33,8 +33,8 @@ if not GEMINI_API_KEY or not PLANT_ID_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Load your trained health model
-# --- CHANGED: Load the TFLite model ---
-interpreter = tflite.Interpreter(model_path="model.tflite")
+print("Loading health model...")
+interpreter = tf.lite.Interpreter(model_path="model.tflite")
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
@@ -58,12 +58,13 @@ user_points_storage = {}
 # --- REWRITTEN: predict_health function for TFLite ---
 def predict_health(image_path):
     try:
-        # Load and preprocess the image
         img = Image.open(image_path).resize((224, 224))
+        # Ensure image is RGB
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
         img_array = np.array(img, dtype=np.float32)
         img_array = np.expand_dims(img_array, axis=0) / 255.0
 
-        # Set the tensor, invoke the interpreter, and get results
         interpreter.set_tensor(input_details[0]['index'], img_array)
         interpreter.invoke()
         predictions = interpreter.get_tensor(output_details[0]['index'])
