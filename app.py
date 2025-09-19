@@ -80,7 +80,7 @@ def get_care_advice(disease_name, plant_name):
     if "healthy" in disease_name.lower():
         return "The plant appears healthy! Keep up the great work. Ensure it gets regular watering, adequate sunlight, and balanced nutrients to stay strong."
     try:
-        model = genai.GenerativeModel('gemini-pro')
+        model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"""
         You are a helpful assistant for farmers in Punjab, India. A plant has been diagnosed.
         Plant Type: {plant_name}, Disease/Issue: {disease_name}.
