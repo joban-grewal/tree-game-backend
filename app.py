@@ -154,21 +154,38 @@ def upload():
         "points": user_points
     })
 
+# In app.py, replace only your '/diagnose' function with this new version.
+
 @app.route('/diagnose', methods=['POST'])
 def diagnose():
-    if "image" not in request.files: return jsonify({"success": False, "error": "No image uploaded"}), 400
+    if "image" not in request.files:
+        return jsonify({"success": False, "error": "No image uploaded"}), 400
     
+    # NEW: Get the species name sent from the frontend
+    species_from_upload = request.form.get('species', 'Unknown')
+
     image_file = request.files["image"]
     name = secure_filename(image_file.filename)
     path = os.path.join(app.config['UPLOAD_FOLDER'], name)
     image_file.save(path)
 
-    diagnosis, disease_name, plant_name = predict_health(path)
-    if not disease_name: return jsonify({"success": False, "error": "Prediction failed"})
+    diagnosis, disease_name, plant_name_from_model = predict_health(path)
     
-    care_advice = get_care_advice(disease_name, plant_name)
+    if not disease_name:
+        return jsonify({"success": False, "error": "Prediction failed"})
 
-    return jsonify({"success": True, "diagnosis": diagnosis, "care_advice": care_advice})
+    # NEW: Logic to check if the models agree on the plant type
+    if plant_name_from_model.lower() not in species_from_upload.lower():
+        error_message = f"Health check mismatch. The plant was identified as a {species_from_upload}, but the health model detected an issue related to a {plant_name_from_model}."
+        return jsonify({"success": False, "error": error_message})
+    
+    care_advice = get_care_advice(disease_name, plant_name_from_model)
+
+    return jsonify({
+        "success": True,
+        "diagnosis": diagnosis,
+        "care_advice": care_advice
+    })
 
 # ... (Your leaderboard endpoint can remain here) ...
 @app.route('/leaderboard', methods=['GET'])
