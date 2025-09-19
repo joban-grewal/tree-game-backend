@@ -50,10 +50,10 @@ user_points_storage = {}
 # --- 3. HELPER FUNCTIONS ---
 
 # --- REWRITTEN: predict_health function for TFLite ---
-def predict_health(image_path):
+def predict_health(image_path, expected_plant_name):
     try:
+        # --- Image Preprocessing (same as before) ---
         img = Image.open(image_path).resize((224, 224))
-        # Ensure image is RGB
         if img.mode != 'RGB':
             img = img.convert('RGB')
         img_array = np.array(img, dtype=np.float32)
@@ -61,18 +61,36 @@ def predict_health(image_path):
 
         interpreter.set_tensor(input_details[0]['index'], img_array)
         interpreter.invoke()
-        predictions = interpreter.get_tensor(output_details[0]['index'])
+        predictions = interpreter.get_tensor(output_details[0]['index'])[0] # Get the 1D array of probabilities
+
+        # --- NEW "SMART" LOGIC ---
+        # Find the indices of all classes that match the expected plant
+        # For example, find all 'Potato___...' classes
+        matching_indices = [i for i, class_name in enumerate(class_names) if expected_plant_name.lower() in class_name.lower()]
+
+        if not matching_indices:
+            return f"No health information available for {expected_plant_name}.", None, None
+
+        # Filter the predictions to only include those for the matching plant
+        matching_predictions = predictions[matching_indices]
+
+        # Find the highest probability *within the filtered predictions*
+        best_match_index_in_filtered = np.argmax(matching_predictions)
         
-        predicted_class = class_names[np.argmax(predictions[0])]
-        confidence = round(100 * np.max(predictions[0]), 2)
+        # Map this back to the original index in the full class_names list
+        final_class_index = matching_indices[best_match_index_in_filtered]
+        
+        predicted_class = class_names[final_class_index]
+        confidence = round(100 * matching_predictions[best_match_index_in_filtered], 2)
         
         disease_name = predicted_class.split('___')[-1].replace('_', ' ')
-        plant_name = predicted_class.split('___')[0].replace('_', ' ')
-        diagnosis = f"{plant_name}: {disease_name} (Confidence: {confidence}%)"
+        plant_name_from_model = predicted_class.split('___')[0].replace('_', ' ')
+        diagnosis = f"{plant_name_from_model}: {disease_name} (Confidence: {confidence}%)"
         
-        return diagnosis, disease_name, plant_name
+        return diagnosis, disease_name, plant_name_from_model
+
     except Exception as e:
-        print(f"Error in TFLite health prediction: {e}")
+        print(f"Error in smart health prediction: {e}")
         return "Health status could not be determined.", None, None
 
 def get_care_advice(disease_name, plant_name):
@@ -158,28 +176,21 @@ def upload():
 
 @app.route('/diagnose', methods=['POST'])
 def diagnose():
-    if "image" not in request.files:
-        return jsonify({"success": False, "error": "No image uploaded"}), 400
+    if "image" not in request.files: return jsonify({"success": False, "error": "No image uploaded"}), 400
     
-    # NEW: Get the species name sent from the frontend
     species_from_upload = request.form.get('species', 'Unknown')
-
     image_file = request.files["image"]
     name = secure_filename(image_file.filename)
     path = os.path.join(app.config['UPLOAD_FOLDER'], name)
     image_file.save(path)
 
-    diagnosis, disease_name, plant_name_from_model = predict_health(path)
+    # Pass the expected species name to the prediction function
+    diagnosis, disease_name, plant_name = predict_health(path, species_from_upload)
     
     if not disease_name:
-        return jsonify({"success": False, "error": "Prediction failed"})
-
-    # NEW: Logic to check if the models agree on the plant type
-    if plant_name_from_model.lower() not in species_from_upload.lower():
-        error_message = f"Health check mismatch. The plant was identified as a {species_from_upload}, but the health model detected an issue related to a {plant_name_from_model}."
-        return jsonify({"success": False, "error": error_message})
+        return jsonify({"success": False, "error": diagnosis}) # Return the error message from predict_health
     
-    care_advice = get_care_advice(disease_name, plant_name_from_model)
+    care_advice = get_care_advice(disease_name, plant_name)
 
     return jsonify({
         "success": True,
