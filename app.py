@@ -5,6 +5,80 @@ from werkzeug.utils import secure_filename
 import requests
 import base64
 
+import google.generativeai as genai
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+import numpy as np
+
+# --- 1. CONFIGURE YOUR AI MODELS ---
+# Get your Gemini API key from an environment variable for safety
+GEMINI_API_KEY = os.environ.get('AIzaSyAfEBbRrXlxwqgbvOXM9SblWJukYQc7sBc')
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Load your trained health model
+health_model = load_model('punjab_crops_model.h5')
+
+class_names = ['Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_', 'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight', 'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot', 'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus', 'Tomato___healthy']
+
+# --- 2. DEFINE AI HELPER FUNCTIONS ---
+def predict_health(image_path):
+    """Loads an image and predicts its health status using your trained model."""
+    try:
+        img = image.load_img(image_path, target_size=(224, 224))
+        img_array = image.img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0) / 255.0
+
+        predictions = health_model.predict(img_array)
+        
+        predicted_class = class_names[np.argmax(predictions[0])]
+        confidence = round(100 * np.max(predictions[0]), 2)
+        
+        # Clean up the name for better display and for the Gemini prompt
+        disease_name = predicted_class.split('___')[-1].replace('_', ' ')
+        plant_name = predicted_class.split('___')[0].replace('_', ' ')
+
+        diagnosis = f"{plant_name}: {disease_name} (Confidence: {confidence}%)"
+        
+        return diagnosis, disease_name, plant_name
+    except Exception as e:
+        print(f"Error in health prediction: {e}")
+        return "Health status could not be determined.", None, None
+
+def get_care_advice(disease_name, plant_name):
+    """Generates care advice using the Gemini AI model."""
+    if "healthy" in disease_name.lower():
+        return "The plant appears healthy! Keep up the great work. Ensure it gets regular watering, adequate sunlight, and balanced nutrients to stay strong."
+
+    try:
+        model = genai.GenerativeModel('gemini-pro')
+        prompt = f"""
+        You are a helpful assistant for farmers and gardeners in Punjab, India.
+        A plant has been diagnosed with a health issue.
+        
+        Plant Type: {plant_name}
+        Disease/Issue: {disease_name}
+
+        Provide a concise and actionable care plan. The advice should be practical for a local Punjabi context.
+        Include sections for:
+        1.  **Immediate Actions:** (e.g., pruning, isolation)
+        2.  **Organic Treatment:** (e.g., Neem oil, specific mixtures)
+        3.  **Nutrient Support:** (e.g., what nutrients might be lacking or needed)
+        4.  **Prevention:** (e.g., watering practices, crop rotation)
+
+        Format the response using simple HTML like <p> and <ul> for lists. Be encouraging.
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"Error generating care advice with Gemini: {e}")
+        return "Could not generate care advice at this time."
+
+# --- 3. SETUP FLASK APP ---
+app = Flask(__name__)
+CORS(app)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
 
 def get_wikipedia_summary(title):
     """Fetch Wikipedia summary with improved error handling and headers."""
@@ -135,6 +209,31 @@ def upload():
         "points": user_points
     })
 
+# --- NEW: DIAGNOSE ENDPOINT ---
+@app.route('/diagnose', methods=['POST'])
+def diagnose():
+    if "image" not in request.files:
+        return jsonify({"success": False, "error": "No image uploaded"}), 400
+
+    image_file = request.files["image"]
+    name = secure_filename(image_file.filename)
+    path = os.path.join(app.config['UPLOAD_FOLDER'], name)
+    image_file.save(path)
+
+    # Step 1: Get diagnosis from your custom model
+    diagnosis, disease_name, plant_name = predict_health(path)
+    
+    if not disease_name:
+        return jsonify({"success": False, "error": "Prediction failed"})
+
+    # Step 2: Get care advice from Gemini AI
+    care_advice = get_care_advice(disease_name, plant_name)
+
+    return jsonify({
+        "success": True,
+        "diagnosis": diagnosis,
+        "care_advice": care_advice
+    })
 
 @app.route('/leaderboard', methods=['GET'])
 def leaderboard():
@@ -148,6 +247,15 @@ def leaderboard():
 
 
 if __name__ == "__main__":
+    # Ensure the uploads folder exists
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+    # IMPORTANT: Check if the Gemini API key is set before starting
+    # This prevents the app from crashing if the key is missing.
+    if not GEMINI_API_KEY:
+        raise ValueError("A major issue has been found: GEMINI_API_KEY environment variable not set. Please set it before running the application.")
+
+    # Define the port and run the app
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=False, host="0.0.0.0", port=port)
+    # Using debug=True is great for local development
+    app.run(host="0.0.0.0", port=port, debug=True)
