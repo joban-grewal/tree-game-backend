@@ -14,7 +14,8 @@ from dotenv import load_dotenv
 load_dotenv() # Load environment variables from a .env file
 
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+# Allow requests from any origin ("*")
+CORS(app, resources={r"/*": {"origins": "*"}})
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
