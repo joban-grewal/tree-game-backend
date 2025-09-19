@@ -23,9 +23,9 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 MODEL_IS_LOADED = False
 
 # --- 2. CONFIGURE AI MODELS (SECURELY) ---
-# FIXED: Load API keys safely from environment variables
-GEMINI_API_KEY = os.environ.get('AIzaSyAfEBbRrXlxwqgbvOXM9SblWJukYQc7sBc')
-PLANT_ID_API_KEY = os.environ.get('1VkeVK7iJfw6AbMXkdxZoePg9Ys55eFWMQubuKRMdivwtyzTKD')
+## THIS IS CORRECT
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+PLANT_ID_API_KEY = os.environ.get('PLANT_ID_API_KEY')
 
 if not GEMINI_API_KEY or not PLANT_ID_API_KEY:
     raise ValueError("Crucial API key is missing! Please set GEMINI_API_KEY and PLANT_ID_API_KEY in your .env file.")
