@@ -4,219 +4,559 @@ import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import google.generativeai as genai
 import tensorflow as tf
 from PIL import Image
 import numpy as np
 from dotenv import load_dotenv
+import logging
+from datetime import datetime, timedelta
+import json
+import hashlib
+import time
+from functools import wraps
+import re
 
-# --- 1. SETUP AND CONFIGURATION ---
-load_dotenv() # Load environment variables from a .env file
+# ===== CONFIGURATION =====
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# Allow requests from any origin ("*")
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# App configuration
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB max
 app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-key-change-in-production')
+
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- NEW: Health Check Flag ---
-# This variable will track if our heavy model is ready.
-MODEL_IS_LOADED = False
-
-# --- 2. CONFIGURE AI MODELS (SECURELY) ---
-## THIS IS CORRECT
+# API Keys
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 PLANT_ID_API_KEY = os.environ.get('PLANT_ID_API_KEY')
 
 if not GEMINI_API_KEY or not PLANT_ID_API_KEY:
-    raise ValueError("Crucial API key is missing! Please set GEMINI_API_KEY and PLANT_ID_API_KEY in your .env file.")
+    logger.error("Critical: API keys missing!")
+    raise ValueError("GEMINI_API_KEY and PLANT_ID_API_KEY must be set")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Load your trained health model
-print("Loading health model...")
-interpreter = tf.lite.Interpreter(model_path="model.tflite")
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
-class_names = ['Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_', 'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight', 'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot', 'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus', 'Tomato___healthy']
-print("Health model loaded successfully!")
-# --- NEW: Flip the flag to True now that the model is loaded ---
-MODEL_IS_LOADED = True
+# ===== MODEL LOADING =====
+MODEL_IS_LOADED = False
 
-# In-memory storage for demo purposes
-user_points_storage = {}
+try:
+    logger.info("Loading TensorFlow Lite model...")
+    interpreter = tf.lite.Interpreter(model_path="model.tflite")
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    
+    class_names = ['Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_', 'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight', 'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot', 'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus', 'Tomato___healthy']
+    
+    MODEL_IS_LOADED = True
+    logger.info("Model loaded successfully!")
+except Exception as e:
+    logger.error(f"Failed to load model: {e}")
+    MODEL_IS_LOADED = False
 
-# --- 3. HELPER FUNCTIONS ---
+# ===== IN-MEMORY STORAGE =====
+class GameDatabase:
+    def __init__(self):
+        self.users = {}
+        self.leaderboard = []
+        self.achievements = {}
+        self.daily_challenges = {}
+        self.rate_limits = {}
+        
+    def get_user(self, user_id):
+        if user_id not in self.users:
+            self.users[user_id] = {
+                'id': user_id,
+                'username': f'User_{user_id[:8]}',
+                'points': 0,
+                'level': 1,
+                'experience': 0,
+                'trees_identified': 0,
+                'achievements': [],
+                'streak': 0,
+                'last_active': datetime.now().isoformat(),
+                'collection': []
+            }
+        return self.users[user_id]
+    
+    def update_user(self, user_id, data):
+        user = self.get_user(user_id)
+        user.update(data)
+        self.users[user_id] = user
+        self.update_leaderboard()
+    
+    def update_leaderboard(self):
+        self.leaderboard = sorted(
+            [{'user': u['username'], 'points': u['points'], 'level': u['level']} 
+             for u in self.users.values()],
+            key=lambda x: x['points'],
+            reverse=True
+        )[:100]  # Top 100
+    
+    def add_achievement(self, user_id, achievement_id):
+        user = self.get_user(user_id)
+        if achievement_id not in user['achievements']:
+            user['achievements'].append(achievement_id)
+            user['points'] += 50
+            self.update_user(user_id, user)
 
-# --- REWRITTEN: predict_health function for TFLite ---
-def predict_health(image_path, expected_plant_name):
+db = GameDatabase()
+
+# ===== HELPER FUNCTIONS =====
+def generate_user_id(request):
+    """Generate unique user ID from request"""
+    ip = request.remote_addr
+    user_agent = request.headers.get('User-Agent', '')
+    unique_string = f"{ip}{user_agent}"
+    return hashlib.md5(unique_string.encode()).hexdigest()
+
+def allowed_file(filename):
+    """Check if file extension is allowed"""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
+
+def rate_limit(max_requests=10, window=60):
+    """Simple rate limiting decorator"""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            user_id = generate_user_id(request)
+            now = time.time()
+            
+            if user_id not in db.rate_limits:
+                db.rate_limits[user_id] = []
+            
+            # Clean old requests
+            db.rate_limits[user_id] = [
+                t for t in db.rate_limits[user_id]
+                if now - t < window
+            ]
+            
+            if len(db.rate_limits[user_id]) >= max_requests:
+                return jsonify({
+                    'success': False,
+                    'error': 'Rate limit exceeded. Please wait.'
+                }), 429
+            
+            db.rate_limits[user_id].append(now)
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+def calculate_points(confidence, is_rare=False):
+    """Calculate points based on confidence and rarity"""
+    base_points = 10
+    confidence_bonus = int(confidence / 10)
+    rarity_bonus = 20 if is_rare else 0
+    return base_points + confidence_bonus + rarity_bonus
+
+def normalize_plant_name(name):
+    """Normalize plant names for matching"""
+    name = re.sub(r'[^\w\s]', '', name.lower())
+    replacements = {
+        'corn': 'maize',
+        'maize': 'corn',
+        'tomatoes': 'tomato',
+        'potatoes': 'potato'
+    }
+    for old, new in replacements.items():
+        if old in name:
+            return new
+    return name
+
+def predict_health(image_path, expected_plant):
+    """Predict plant health using TFLite model"""
+    if not MODEL_IS_LOADED:
+        return "Health service temporarily unavailable", None, None
+    
     try:
-        # --- Image Preprocessing (same as before) ---
-        img = Image.open(image_path).resize((224, 224))
-        if img.mode != 'RGB':
+        # Preprocess image
+        img = Image.open(image_path)
+        if img.mode == 'RGBA':
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            img = background
+        elif img.mode != 'RGB':
             img = img.convert('RGB')
+        
+        img = img.resize((224, 224), Image.Resampling.LANCZOS)
         img_array = np.array(img, dtype=np.float32)
         img_array = np.expand_dims(img_array, axis=0) / 255.0
-
+        
+        # Run inference
         interpreter.set_tensor(input_details[0]['index'], img_array)
         interpreter.invoke()
-        predictions = interpreter.get_tensor(output_details[0]['index'])[0] # Get the 1D array of probabilities
-
-        # --- NEW "SMART" LOGIC ---
-        # Find the indices of all classes that match the expected plant
-        # For example, find all 'Potato___...' classes
-        matching_indices = [i for i, class_name in enumerate(class_names) if expected_plant_name.lower() in class_name.lower()]
-
+        predictions = interpreter.get_tensor(output_details[0]['index'])[0]
+        
+        # Smart matching
+        normalized_expected = normalize_plant_name(expected_plant)
+        matching_indices = []
+        
+        for i, class_name in enumerate(class_names):
+            normalized_class = normalize_plant_name(class_name)
+            if normalized_expected in normalized_class or normalized_class in normalized_expected:
+                matching_indices.append(i)
+        
         if not matching_indices:
-            return f"No health information available for {expected_plant_name}.", None, None
-
-        # Filter the predictions to only include those for the matching plant
+            return f"Health analysis not available for {expected_plant}", None, None
+        
+        # Get best match
         matching_predictions = predictions[matching_indices]
-
-        # Find the highest probability *within the filtered predictions*
-        best_match_index_in_filtered = np.argmax(matching_predictions)
+        best_idx = np.argmax(matching_predictions)
+        final_idx = matching_indices[best_idx]
         
-        # Map this back to the original index in the full class_names list
-        final_class_index = matching_indices[best_match_index_in_filtered]
+        predicted_class = class_names[final_idx]
+        confidence = round(100 * matching_predictions[best_idx], 2)
         
-        predicted_class = class_names[final_class_index]
-        confidence = round(100 * matching_predictions[best_match_index_in_filtered], 2)
+        parts = predicted_class.split('___')
+        plant_name = parts[0].replace('_', ' ')
+        disease_name = parts[-1].replace('_', ' ') if len(parts) > 1 else 'Unknown'
         
-        disease_name = predicted_class.split('___')[-1].replace('_', ' ')
-        plant_name_from_model = predicted_class.split('___')[0].replace('_', ' ')
-        diagnosis = f"{plant_name_from_model}: {disease_name} (Confidence: {confidence}%)"
+        diagnosis = f"{plant_name}: {disease_name} (Confidence: {confidence}%)"
         
-        return diagnosis, disease_name, plant_name_from_model
-
+        return diagnosis, disease_name, plant_name
+        
     except Exception as e:
-        print(f"Error in smart health prediction: {e}")
-        return "Health status could not be determined.", None, None
+        logger.error(f"Health prediction error: {e}")
+        return "Unable to analyze image", None, None
 
 def get_care_advice(disease_name, plant_name):
-    # Your get_care_advice function is good, no changes needed here.
+    """Generate care advice using Gemini"""
     if "healthy" in disease_name.lower():
-        return "The plant appears healthy! Keep up the great work. Ensure it gets regular watering, adequate sunlight, and balanced nutrients to stay strong."
+        return """
+        <div class='care-success'>
+            <h4>✅ Your plant is healthy!</h4>
+            <ul>
+                <li>🌱 Maintain regular watering schedule</li>
+                <li>☀️ Ensure adequate sunlight</li>
+                <li>🌿 Monitor for early signs of stress</li>
+                <li>💚 Apply balanced fertilizer monthly</li>
+            </ul>
+        </div>
+        """
+    
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"""
-        You are a helpful assistant for farmers in Punjab, India. A plant has been diagnosed.
-        Plant Type: {plant_name}, Disease/Issue: {disease_name}.
-        Provide a concise, actionable care plan with sections for Immediate Actions, Organic Treatment, Nutrient Support, and Prevention. Format the response using simple HTML.
+        Plant: {plant_name}
+        Disease: {disease_name}
+        
+        Provide care advice in this HTML format:
+        <div class='care-advice'>
+            <h4>Immediate Actions:</h4>
+            <ul><li>2-3 urgent steps</li></ul>
+            <h4>Treatment:</h4>
+            <ul><li>Organic and chemical options</li></ul>
+            <h4>Prevention:</h4>
+            <ul><li>Future prevention tips</li></ul>
+        </div>
+        Keep it concise and practical.
         """
+        
         response = model.generate_content(prompt)
         return response.text
+        
     except Exception as e:
-        print(f"Error generating care advice with Gemini: {e}")
-        return "Could not generate care advice at this time."
+        logger.error(f"Gemini error: {e}")
+        return """
+        <div class='care-advice'>
+            <h4>General Care Guidelines:</h4>
+            <ul>
+                <li>🔬 Isolate affected plants</li>
+                <li>✂️ Remove diseased parts</li>
+                <li>💧 Adjust watering schedule</li>
+                <li>🌬️ Improve air circulation</li>
+                <li>🧪 Consider organic fungicides</li>
+            </ul>
+        </div>
+        """
 
 def get_wikipedia_summary(title):
-    # Your get_wikipedia_summary is good, no changes needed.
-    headers = {'User-Agent': 'TreeGuardianGame/1.0'}
-    base_url = "https://en.wikipedia.org/api/rest_v1/page/summary/"
+    """Fetch Wikipedia summary"""
     try:
-        url = base_url + title.replace(' ', '_')
-        response = requests.get(url, headers=headers, timeout=10)
+        clean_title = title.split('(')[0].strip().replace(' ', '_')
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{clean_title}"
+        response = requests.get(url, timeout=5)
+        
         if response.status_code == 200:
-            return response.json().get('extract', 'No Wikipedia summary available.')
+            extract = response.json().get('extract', '')
+            return extract[:300] + '...' if len(extract) > 300 else extract
     except Exception as e:
-        print(f"Error fetching Wikipedia summary: {e}")
-    return 'No Wikipedia summary available.'
+        logger.warning(f"Wikipedia error: {e}")
+    
+    return f"{title} is an interesting plant species. Keep exploring!"
 
-# --- 4. API ENDPOINTS ---
+# ===== API ENDPOINTS =====
 
-
-# --- NEW: Smart Health Check Endpoint ---
 @app.route('/healthz')
 def health_check():
-    # This endpoint will be pinged by Render.
-    # It will fail until the model is loaded, then it will succeed.
-    if MODEL_IS_LOADED:
-        return jsonify({"status": "ok"}), 200
-    else:
-        # Return a 503 Service Unavailable status while the model is loading
-        return jsonify({"status": "model_loading"}), 503
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy' if MODEL_IS_LOADED else 'degraded',
+        'model': 'loaded' if MODEL_IS_LOADED else 'loading',
+        'timestamp': datetime.now().isoformat(),
+        'version': '2.0.0'
+    }), 200 if MODEL_IS_LOADED else 503
 
 @app.route('/upload', methods=['POST'])
+@rate_limit(max_requests=20, window=60)
 def upload():
-    if "image" not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
-
-    image_file = request.files["image"]
-    name = secure_filename(image_file.filename)
-    path = os.path.join(app.config['UPLOAD_FOLDER'], name)
-    image_file.save(path)
-
-    with open(path, "rb") as img_f:
-        img_b64 = base64.b64encode(img_f.read()).decode("ascii")
-
-    url = "https://api.plant.id/v2/identify"
-    response = requests.post(
-        url,
-        headers={"Content-Type": "application/json", "Api-Key": PLANT_ID_API_KEY}, # FIXED: Use env variable
-        json={"images": [img_b64]},
-        timeout=45,
-    )
-    info = response.json()
-    
-    species = info['suggestions'][0]['plant_name'] if info.get('suggestions') else "Unknown"
-    confidence = int(info['suggestions'][0]['probability'] * 100) if info.get('suggestions') else 0
-    wiki_summary = get_wikipedia_summary(species)
-
-    user_points = user_points_storage.get('Demo User', 0) + 1
-    user_points_storage['Demo User'] = user_points
-
-    return jsonify({
-        "success": True, "filename": name,
-        "info": {"species": species, "confidence": confidence, "wiki_summary": wiki_summary},
-        "points": user_points
-    })
-
-# In app.py, replace only your '/diagnose' function with this new version.
+    """Upload and identify plant"""
+    try:
+        user_id = generate_user_id(request)
+        user = db.get_user(user_id)
+        
+        # Check file
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'No image provided'}), 400
+        
+        image_file = request.files['image']
+        if not allowed_file(image_file.filename):
+            return jsonify({'success': False, 'error': 'Invalid file type'}), 400
+        
+        # Save file
+        filename = secure_filename(image_file.filename)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{timestamp}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        image_file.save(filepath)
+        
+        # Optimize image
+        with Image.open(filepath) as img:
+            if img.size[0] > 1024 or img.size[1] > 1024:
+                img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+                img.save(filepath, optimize=True, quality=85)
+        
+        # Prepare for Plant.ID
+        with open(filepath, 'rb') as f:
+            img_b64 = base64.b64encode(f.read()).decode('ascii')
+        
+        # Call Plant.ID API
+        logger.info(f"Identifying plant for user {user_id}")
+        response = requests.post(
+            'https://api.plant.id/v2/identify',
+            headers={'Content-Type': 'application/json', 'Api-Key': PLANT_ID_API_KEY},
+            json={'images': [img_b64], 'plant_details': ['common_names']},
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            return jsonify({'success': False, 'error': 'Identification service unavailable'}), 503
+        
+        data = response.json()
+        
+        # Parse results
+        if data.get('suggestions'):
+            suggestion = data['suggestions'][0]
+            species = suggestion.get('plant_name', 'Unknown')
+            confidence = int(suggestion.get('probability', 0) * 100)
+            common_names = suggestion.get('plant_details', {}).get('common_names', [])
+            
+            if common_names:
+                species += f" ({', '.join(common_names[:2])})"
+        else:
+            species = 'Unknown'
+            confidence = 0
+        
+        # Calculate rewards
+        points_earned = calculate_points(confidence)
+        experience_earned = 20
+        
+        # Update user stats
+        user['points'] += points_earned
+        user['experience'] += experience_earned
+        user['trees_identified'] += 1
+        user['last_active'] = datetime.now().isoformat()
+        
+        # Check for level up
+        if user['experience'] >= user['level'] * 100:
+            user['level'] += 1
+            user['experience'] = 0
+            points_earned += 100  # Level up bonus
+        
+        # Add to collection
+        user['collection'].append({
+            'species': species,
+            'confidence': confidence,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        # Check achievements
+        if user['trees_identified'] == 1:
+            db.add_achievement(user_id, 'first_tree')
+        elif user['trees_identified'] == 10:
+            db.add_achievement(user_id, 'collector')
+        elif user['trees_identified'] == 50:
+            db.add_achievement(user_id, 'expert')
+        
+        db.update_user(user_id, user)
+        
+        # Get Wikipedia info
+        wiki_summary = get_wikipedia_summary(species.split('(')[0].strip())
+        
+        # Clean up old file
+        try:
+            os.remove(filepath)
+        except:
+            pass
+        
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'info': {
+                'species': species,
+                'confidence': confidence,
+                'wiki_summary': wiki_summary
+            },
+            'points_earned': points_earned,
+            'user_stats': {
+                'points': user['points'],
+                'level': user['level'],
+                'experience': user['experience']
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return jsonify({'success': False, 'error': 'Processing failed'}), 500
 
 @app.route('/diagnose', methods=['POST'])
+@rate_limit(max_requests=10, window=60)
 def diagnose():
-    if "image" not in request.files: return jsonify({"success": False, "error": "No image uploaded"}), 400
-    
-    species_from_upload = request.form.get('species', 'Unknown')
-    image_file = request.files["image"]
-    name = secure_filename(image_file.filename)
-    path = os.path.join(app.config['UPLOAD_FOLDER'], name)
-    image_file.save(path)
+    """Diagnose plant health"""
+    try:
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'error': 'No image provided'}), 400
+        
+        species = request.form.get('species', 'Unknown')
+        image_file = request.files['image']
+        
+        # Save file
+        filename = secure_filename(image_file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], f"health_{filename}")
+        image_file.save(filepath)
+        
+        # Get diagnosis
+        diagnosis, disease, plant = predict_health(filepath, species)
+        
+        if not disease:
+            return jsonify({'success': False, 'error': diagnosis})
+        
+        # Get care advice
+        care_advice = get_care_advice(disease, plant)
+        
+        # Update user stats
+        user_id = generate_user_id(request)
+        user = db.get_user(user_id)
+        user['points'] += 5  # Points for health check
+        db.update_user(user_id, user)
+        
+        # Clean up
+        try:
+            os.remove(filepath)
+        except:
+            pass
+        
+        return jsonify({
+            'success': True,
+            'diagnosis': diagnosis,
+            'care_advice': care_advice,
+            'plant_name': plant,
+            'condition': disease
+        })
+        
+    except Exception as e:
+        logger.error(f"Diagnosis error: {e}")
+        return jsonify({'success': False, 'error': 'Diagnosis failed'}), 500
 
-    # Pass the expected species name to the prediction function
-    diagnosis, disease_name, plant_name = predict_health(path, species_from_upload)
-    
-    if not disease_name:
-        return jsonify({"success": False, "error": diagnosis}) # Return the error message from predict_health
-    
-    care_advice = get_care_advice(disease_name, plant_name)
-
-    return jsonify({
-        "success": True,
-        "diagnosis": diagnosis,
-        "care_advice": care_advice
-    })
-
-# ... (Your leaderboard endpoint can remain here) ...
 @app.route('/leaderboard', methods=['GET'])
 def leaderboard():
-    # A simplified leaderboard using the in-memory storage
-    demo_points = user_points_storage.get('Demo User', 0)
-    
-    # You can add some dummy users to make it look more populated
-    leaderboard_data = [
-        {"user": "Bot Alpha", "points": 15},
-        {"user": "Demo User", "points": demo_points},
-        {"user": "Bot Beta", "points": 8},
-    ]
-    
-    # Sort the list by points in descending order
-    leaderboard_data.sort(key=lambda x: x['points'], reverse=True)
-    
-    return jsonify(leaderboard_data)
+    """Get leaderboard data"""
+    try:
+        # Add some bot players for engagement
+        bots = [
+            {'user': 'TreeMaster Pro', 'points': 2500, 'level': 15},
+            {'user': 'Forest Guardian', 'points': 2000, 'level': 12},
+            {'user': 'Leaf Expert', 'points': 1500, 'level': 10},
+            {'user': 'Nature Wizard', 'points': 1000, 'level': 8},
+            {'user': 'Plant Doctor', 'points': 750, 'level': 6}
+        ]
+        
+        # Combine real users and bots
+        all_players = db.leaderboard + bots
+        all_players.sort(key=lambda x: x['points'], reverse=True)
+        
+        return jsonify(all_players[:20])  # Top 20
+        
+    except Exception as e:
+        logger.error(f"Leaderboard error: {e}")
+        return jsonify([]), 500
 
-# --- 5. RUN THE APP ---
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+@app.route('/user/stats', methods=['GET'])
+def user_stats():
+    """Get user statistics"""
+    try:
+        user_id = generate_user_id(request)
+        user = db.get_user(user_id)
+        
+        return jsonify({
+            'success': True,
+            'stats': {
+                'points': user['points'],
+                'level': user['level'],
+                'experience': user['experience'],
+                'trees_identified': user['trees_identified'],
+                'achievements': user['achievements'],
+                'streak': user['streak']
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        return jsonify({'success': False}), 500
+
+@app.route('/achievements', methods=['GET'])
+def achievements():
+    """Get achievements list"""
+    return jsonify({
+        'achievements': [
+            {'id': 'first_tree', 'name': 'First Discovery', 'points': 50},
+            {'id': 'collector', 'name': 'Tree Collector', 'points': 50},
+            {'id': 'expert', 'name': 'Forest Expert', 'points': 100},
+            {'id': 'streak_week', 'name': 'Week Warrior', 'points': 75},
+            {'id': 'perfect_diagnosis', 'name': 'Plant Doctor', 'points': 50}
+        ]
+    })
+
+# ===== ERROR HANDLERS =====
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'error': 'File too large (max 10MB)'}), 413
+
+@app.errorhandler(500)
+def server_error(e):
+    logger.error(f"Server error: {e}")
+    return jsonify({'error': 'Internal server error'}), 500
+
+# ===== MAIN =====
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"🌳 Tree Guardian API starting on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
