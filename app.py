@@ -165,73 +165,139 @@ def calculate_points(confidence, is_rare=False):
 
 def normalize_plant_name(name):
     """Normalize plant names for matching"""
+    if not name:
+        return ""
     name = re.sub(r'[^\w\s]', '', name.lower())
     replacements = {
         'corn': 'maize',
         'maize': 'corn',
         'tomatoes': 'tomato',
-        'potatoes': 'potato'
+        'tomato plant': 'tomato',
+        'potatoes': 'potato',
+        'potato plant': 'potato'
     }
-    for old, new in replacements.items():
-        if old in name:
-            return new
+    for variant, normalized in replacements.items():
+        if variant in name:
+            return normalized
+    
+    # Check for partial matches
+    for key in ['corn', 'tomato', 'potato']:
+        if key in name:
+            return key
+    
     return name
 
 def predict_health(image_path, expected_plant):
-    """Predict plant health using TFLite model"""
+    """Enhanced health prediction with better accuracy"""
     if not MODEL_IS_LOADED:
         return "Health service temporarily unavailable", None, None
     
     try:
-        # Preprocess image
+        # CRITICAL: Proper image preprocessing to match training data
         img = Image.open(image_path)
-        if img.mode == 'RGBA':
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[3])
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
         
+        # Convert to RGB if necessary
+        if img.mode != 'RGB':
+            if img.mode == 'RGBA':
+                # Create white background
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
+        
+        # IMPORTANT: Resize to exact model input size
         img = img.resize((224, 224), Image.Resampling.LANCZOS)
+        
+        # Convert to array and normalize EXACTLY as training data
         img_array = np.array(img, dtype=np.float32)
-        img_array = np.expand_dims(img_array, axis=0) / 255.0
+        img_array = img_array / 255.0  # Normalize to [0, 1]
+        img_array = np.expand_dims(img_array, axis=0)
         
         # Run inference
         interpreter.set_tensor(input_details[0]['index'], img_array)
         interpreter.invoke()
         predictions = interpreter.get_tensor(output_details[0]['index'])[0]
         
-        # Smart matching
+        # Enhanced plant matching with multiple strategies
         normalized_expected = normalize_plant_name(expected_plant)
-        matching_indices = []
         
+        # Strategy 1: Direct matching
+        matching_indices = []
         for i, class_name in enumerate(class_names):
-            normalized_class = normalize_plant_name(class_name)
-            if normalized_expected in normalized_class or normalized_class in normalized_expected:
-                matching_indices.append(i)
+            class_parts = class_name.lower().split('___')[0].replace('_', ' ')
+            
+            # Check for exact plant type match
+            if 'corn' in normalized_expected or 'maize' in normalized_expected:
+                if 'corn' in class_parts or 'maize' in class_parts:
+                    matching_indices.append(i)
+            elif 'tomato' in normalized_expected:
+                if 'tomato' in class_parts:
+                    matching_indices.append(i)
+            elif 'potato' in normalized_expected:
+                if 'potato' in class_parts:
+                    matching_indices.append(i)
+        
+        # Strategy 2: If no matches, try broader search
+        if not matching_indices:
+            # Check if ANY of our supported plants match
+            for plant in ['corn', 'maize', 'tomato', 'potato']:
+                if plant in normalized_expected:
+                    for i, class_name in enumerate(class_names):
+                        if plant in class_name.lower():
+                            matching_indices.append(i)
+                    break
+        
+        # Strategy 3: If still no matches, use all predictions for closest plant
+        if not matching_indices:
+            # Find the most likely plant type from all predictions
+            top_prediction_idx = np.argmax(predictions)
+            predicted_plant = class_names[top_prediction_idx].split('___')[0].replace('_', ' ')
+            
+            logger.warning(f"No exact match for '{expected_plant}', using top prediction: {predicted_plant}")
+            
+            # Get all indices for the top predicted plant type
+            for i, class_name in enumerate(class_names):
+                if predicted_plant.lower() in class_name.lower():
+                    matching_indices.append(i)
         
         if not matching_indices:
-            return f"Health analysis not available for {expected_plant}", None, None
+            return f"Unable to diagnose. Please ensure the image shows a tomato, potato, or corn plant.", None, None
         
-        # Get best match
+        # Get the best prediction from matching classes
         matching_predictions = predictions[matching_indices]
-        best_idx = np.argmax(matching_predictions)
-        final_idx = matching_indices[best_idx]
+        best_match_index = np.argmax(matching_predictions)
+        final_class_index = matching_indices[best_match_index]
         
-        predicted_class = class_names[final_idx]
-        confidence = round(100 * matching_predictions[best_idx], 2)
+        predicted_class = class_names[final_class_index]
+        confidence = round(float(matching_predictions[best_match_index]) * 100, 2)
         
+        # Parse the prediction
         parts = predicted_class.split('___')
-        plant_name = parts[0].replace('_', ' ')
-        disease_name = parts[-1].replace('_', ' ') if len(parts) > 1 else 'Unknown'
+        plant_name = parts[0].replace('_', ' ').replace('(', '').replace(')', '')
         
-        diagnosis = f"{plant_name}: {disease_name} (Confidence: {confidence}%)"
+        if len(parts) > 1:
+            disease_name = parts[1].replace('_', ' ')
+            # Clean up disease name
+            disease_name = disease_name.replace('  ', ' ').strip()
+        else:
+            disease_name = 'Unknown condition'
+        
+        # Create detailed diagnosis
+        if confidence < 30:
+            diagnosis = f"Low confidence ({confidence}%) - Results may not be accurate. Please use a clearer image of the plant leaves."
+        elif 'healthy' in disease_name.lower():
+            diagnosis = f"✅ {plant_name} appears healthy! (Confidence: {confidence}%)"
+        else:
+            diagnosis = f"⚠️ {plant_name} - Detected: {disease_name} (Confidence: {confidence}%)"
+        
+        logger.info(f"Health prediction: {diagnosis}")
         
         return diagnosis, disease_name, plant_name
         
     except Exception as e:
-        logger.error(f"Health prediction error: {e}")
-        return "Unable to analyze image", None, None
+        logger.error(f"Health prediction error: {e}", exc_info=True)
+        return "Unable to analyze image. Please ensure the image clearly shows plant leaves.", None, None
 
 def get_care_advice(disease_name, plant_name):
     """Generate care advice using Gemini"""
@@ -539,6 +605,43 @@ def achievements():
             {'id': 'streak_week', 'name': 'Week Warrior', 'points': 75},
             {'id': 'perfect_diagnosis', 'name': 'Plant Doctor', 'points': 50}
         ]
+    })
+
+@app.route('/debug/health', methods=['POST'])
+def debug_health():
+    """Debug endpoint to test health prediction"""
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image'}), 400
+    
+    image = request.files['image']
+    plant_type = request.form.get('plant', 'tomato')  # Default to tomato
+    
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], 'debug_health.jpg')
+    image.save(filepath)
+    
+    # Get raw predictions
+    img = Image.open(filepath).resize((224, 224))
+    img_array = np.array(img, dtype=np.float32) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
+    
+    interpreter.set_tensor(input_details[0]['index'], img_array)
+    interpreter.invoke()
+    predictions = interpreter.get_tensor(output_details[0]['index'])[0]
+    
+    # Get top 5 predictions
+    top_5 = np.argsort(predictions)[-5:][::-1]
+    results = []
+    for idx in top_5:
+        results.append({
+            'class': class_names[idx],
+            'confidence': float(predictions[idx])
+        })
+    
+    os.remove(filepath)
+    
+    return jsonify({
+        'plant_type': plant_type,
+        'top_predictions': results
     })
 
 # ===== ERROR HANDLERS =====
